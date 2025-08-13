@@ -1,37 +1,115 @@
-# bot.py — Noni's Pirate Go-Live Bot
-# Requirements: discord.py, aiohttp, python-dotenv
-# pip install discord.py aiohttp python-dotenv
+# bot.py — Noni's Pirate Go-Live Bot (Postgres persistence)
+# Requirements in requirements.txt:
+# discord.py, aiohttp, python-dotenv, psycopg2-binary
 
-import asyncio, json, os, time, aiohttp
-from pathlib import Path
-from typing import Dict, Optional
+import os, time, asyncio, aiohttp
+from typing import Optional, Dict
 import discord
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
-# ── Load secrets ────────────────────────────────────────────────────────────────
+# ── DB (psycopg2) ──────────────────────────────────────────────────────────────
+import psycopg2
+import psycopg2.extras
+
+def db_connect():
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("Missing DATABASE_URL environment variable.")
+    # psycopg2 connects synchronously; we keep operations short & infrequent
+    return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
+
+def db_exec(sql: str, params: tuple = ()):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            try:
+                rows = cur.fetchall()
+            except psycopg2.ProgrammingError:
+                rows = None
+        conn.commit()
+    return rows
+
+def init_db():
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS settings (
+        guild_id BIGINT PRIMARY KEY,
+        notify_channel_id BIGINT
+    );
+    """)
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS users (
+        discord_user_id BIGINT PRIMARY KEY,
+        twitch_login TEXT NOT NULL,
+        twitch_id TEXT NOT NULL,
+        display_name TEXT
+    );
+    """)
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS live_state (
+        twitch_id TEXT PRIMARY KEY,
+        started_at TIMESTAMPTZ
+    );
+    """)
+
+def db_set_notify_channel(guild_id: int, channel_id: int):
+    db_exec("""
+    INSERT INTO settings (guild_id, notify_channel_id)
+    VALUES (%s, %s)
+    ON CONFLICT (guild_id) DO UPDATE SET notify_channel_id=EXCLUDED.notify_channel_id;
+    """, (guild_id, channel_id))
+
+def db_get_notify_channel(guild_id: int) -> Optional[int]:
+    rows = db_exec("SELECT notify_channel_id FROM settings WHERE guild_id=%s;", (guild_id,))
+    return rows[0]["notify_channel_id"] if rows else None
+
+def db_upsert_user(discord_user_id: int, login: str, twitch_id: str, display: Optional[str]):
+    db_exec("""
+    INSERT INTO users (discord_user_id, twitch_login, twitch_id, display_name)
+    VALUES (%s, %s, %s, %s)
+    ON CONFLICT (discord_user_id) DO UPDATE
+    SET twitch_login=EXCLUDED.twitch_login, twitch_id=EXCLUDED.twitch_id, display_name=EXCLUDED.display_name;
+    """, (discord_user_id, login, twitch_id, display))
+
+def db_remove_user(discord_user_id: int):
+    db_exec("DELETE FROM users WHERE discord_user_id=%s;", (discord_user_id,))
+
+def db_list_users():
+    return db_exec("SELECT discord_user_id, twitch_login, twitch_id, display_name FROM users ORDER BY discord_user_id;") or []
+
+def db_all_twitch_ids():
+    rows = db_exec("SELECT twitch_id FROM users;") or []
+    return [r["twitch_id"] for r in rows]
+
+def db_get_user_by_discord(discord_user_id: int):
+    rows = db_exec("SELECT * FROM users WHERE discord_user_id=%s;", (discord_user_id,))
+    return rows[0] if rows else None
+
+def db_live_started(twitch_id: str) -> Optional[str]:
+    rows = db_exec("SELECT started_at FROM live_state WHERE twitch_id=%s;", (twitch_id,))
+    return str(rows[0]["started_at"]) if rows and rows[0]["started_at"] else None
+
+def db_set_live(twitch_id: str, started_at_iso: str):
+    db_exec("""
+    INSERT INTO live_state (twitch_id, started_at)
+    VALUES (%s, %s)
+    ON CONFLICT (twitch_id) DO UPDATE SET started_at=EXCLUDED.started_at;
+    """, (twitch_id, started_at_iso))
+
+def db_clear_live(twitch_id: str):
+    db_exec("DELETE FROM live_state WHERE twitch_id=%s;", (twitch_id,))
+
+# ── Load secrets ───────────────────────────────────────────────────────────────
 load_dotenv()
 DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
 TWITCH_CLIENT_ID      = os.getenv("TWITCH_CLIENT_ID")
 TWITCH_CLIENT_SECRET  = os.getenv("TWITCH_CLIENT_SECRET")
 GUILD_ID              = int(os.getenv("GUILD_ID", "0"))
-MENTION_ROLE_ID       = os.getenv("MENTION_ROLE_ID")  # optional role to ping on alerts
-LIVE_ROLE_ID          = os.getenv("LIVE_ROLE_ID")     # optional: role to give/remove while live
+MENTION_ROLE_ID       = os.getenv("MENTION_ROLE_ID")   # optional
+LIVE_ROLE_ID          = os.getenv("LIVE_ROLE_ID")      # optional LIVE role while streaming
 
-# ── Storage (JSON file, nice & simple) ─────────────────────────────────────────
-DATA_PATH = Path("twitch_data.json")
-DEFAULTS  = {"notify_channel_id": None, "users": {}, "live_cache": {}}
-if not DATA_PATH.exists():
-    DATA_PATH.write_text(json.dumps(DEFAULTS, indent=2))
-
-def load_data():
-    return json.loads(DATA_PATH.read_text())
-
-def save_data(d):
-    DATA_PATH.write_text(json.dumps(d, indent=2))
-
-# ── Twitch API helper (client-credentials) ─────────────────────────────────────
+# ── Twitch API helper ──────────────────────────────────────────────────────────
 class TwitchAPI:
     def __init__(self, session: aiohttp.ClientSession):
         self.sess = session
@@ -70,14 +148,13 @@ class TwitchAPI:
         if not user_ids:
             return {}
         url = "https://api.twitch.tv/helix/streams"
-        # multiple user_id params allowed
         params = [("user_id", uid) for uid in user_ids]
         async with self.sess.get(url, headers=await self._headers(), params=params) as r:
             j = await r.json()
             return {s["user_id"]: s for s in j.get("data", [])}
 
 # ── Pretty helpers ─────────────────────────────────────────────────────────────
-PIRATE_PURPLE = 0x8B5CF6  # 💜
+PIRATE_PURPLE = 0x8B5CF6
 PIRATE_EMOJI  = "🏴‍☠️"
 MEGAPHONE     = "📣"
 SPARKLES      = "✨"
@@ -86,12 +163,13 @@ def is_mod(inter: discord.Interaction) -> bool:
     perms = inter.user.guild_permissions
     return perms.administrator or perms.manage_guild
 
-def already_announced(live_cache: dict, twitch_user_id: str, started_at: str) -> bool:
-    """Prevent duplicate posts for the same stream session."""
-    return live_cache.get(twitch_user_id) == started_at
+def already_announced(twitch_user_id: str, started_at: str) -> bool:
+    prev = db_live_started(twitch_user_id)
+    return prev == started_at
+
 def stream_preview_url(login: str, w=1280, h=720):
-    # Twitch live preview template (updates server-side automatically)
     return f"https://static-cdn.jtvnw.net/previews-ttv/live_user_{login}-{w}x{h}.jpg"
+
 def get_role(guild: discord.Guild, role_id: str | None):
     return guild.get_role(int(role_id)) if role_id else None
 
@@ -106,6 +184,7 @@ class Bot(discord.Client):
         self.guild_obj: Optional[discord.Object] = None
 
     async def setup_hook(self):
+        init_db()
         self.session = aiohttp.ClientSession()
         self.twitch  = TwitchAPI(self.session)
         if GUILD_ID:
@@ -113,7 +192,6 @@ class Bot(discord.Client):
             self.tree.copy_global_to(guild=self.guild_obj)
             await self.tree.sync(guild=self.guild_obj)
         else:
-            # Global sync fallback (commands can take up to 1h to appear)
             await self.tree.sync()
         check_live.start()
 
@@ -129,36 +207,30 @@ bot = Bot()
 @app_commands.describe(username="Your Twitch @ (login name, not display name)")
 async def twitch_set(inter: discord.Interaction, username: str):
     await inter.response.defer(ephemeral=True)
-    data = load_data()
-    # Validate on Twitch so typos don't get saved
     u = await bot.twitch.get_user(username)
     if not u:
         return await inter.followup.send("I couldn't find that Twitch user. Double-check the spelling.", ephemeral=True)
-    data["users"][str(inter.user.id)] = {"login": u["login"], "twitch_id": u["id"], "display": u.get("display_name", u["login"])}
-    save_data(data)
+    db_upsert_user(discord_user_id=inter.user.id, login=u["login"], twitch_id=u["id"], display=u.get("display_name"))
     await inter.followup.send(f"{PIRATE_EMOJI} Aye! Linked your Twitch to **{u.get('display_name', u['login'])}**.", ephemeral=True)
 
 @bot.tree.command(name="twitch_remove", description="Unlink your Twitch")
 async def twitch_remove(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True)
-    data = load_data()
-    data["users"].pop(str(inter.user.id), None)
-    save_data(data)
+    db_remove_user(inter.user.id)
     await inter.followup.send("Unlinked your Twitch. Fair winds!", ephemeral=True)
 
 @bot.tree.command(name="twitch_list", description="See who registered (mods only)")
 async def twitch_list(inter: discord.Interaction):
     if not is_mod(inter):
         return await inter.response.send_message("Only Fleet Commanders can use this.", ephemeral=True)
-    data  = load_data()
-    users = data.get("users", {})
-    if not users:
+    rows = db_list_users()
+    if not rows:
         return await inter.response.send_message("No crewmates registered yet.", ephemeral=True)
     lines = []
-    for uid, info in users.items():
-        member = inter.guild.get_member(int(uid))
-        name = member.display_name if member else f"User {uid}"
-        lines.append(f"• **{name}** → `{info['login']}`")
+    for r in rows:
+        member = inter.guild.get_member(int(r["discord_user_id"]))
+        name = member.display_name if member else f"User {r['discord_user_id']}"
+        lines.append(f"• **{name}** → `{r['twitch_login']}`")
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(name="twitch_channel_set", description="Choose the go-live alerts channel (mods only)")
@@ -166,41 +238,29 @@ async def twitch_list(inter: discord.Interaction):
 async def twitch_channel_set(inter: discord.Interaction, channel: discord.TextChannel):
     if not is_mod(inter):
         return await inter.response.send_message("Only Fleet Commanders can use this.", ephemeral=True)
-    data = load_data()
-    data["notify_channel_id"] = channel.id
-    save_data(data)
+    db_set_notify_channel(inter.guild_id, channel.id)
     await inter.response.send_message(f"{PIRATE_EMOJI} Aye! I’ll hail the crew in {channel.mention}.", ephemeral=True)
+
 @bot.tree.command(name="twitch_preview", description="Post a sample go-live embed (mods only)")
 @app_commands.describe(channel="Channel to preview in (defaults to your notify channel)")
 async def twitch_preview(inter: discord.Interaction, channel: discord.TextChannel | None = None):
-    # mods only
     perms = inter.user.guild_permissions
     if not (perms.administrator or perms.manage_guild):
         return await inter.response.send_message("Mods only.", ephemeral=True)
-
-    data = load_data()
-    chan_id = data.get("notify_channel_id")
-    target = channel or (bot.get_channel(chan_id) if chan_id else None)
+    target_id = db_get_notify_channel(inter.guild_id)
+    target = channel or (bot.get_channel(target_id) if target_id else None)
     if not isinstance(target, discord.TextChannel):
         return await inter.response.send_message("No notify channel set. Run /twitch_channel_set first.", ephemeral=True)
-
-    # use your own link if you’re registered, else a sample
-    users = data.get("users", {})
-    uid = str(inter.user.id)
-    info = users.get(uid) or next(iter(users.values()), None)
-    if not info:
+    r = db_get_user_by_discord(inter.user.id) or (db_list_users()[0] if db_list_users() else None)
+    if not r:
         return await inter.response.send_message("No registered users yet. Run /twitch_set first.", ephemeral=True)
-
-    # fake stream data for preview
-    from datetime import datetime, timezone
+    u = await bot.twitch.get_user(r["twitch_login"])
     stream = {
         "title": "Preview voyage across the Grand Line 🌊",
         "game_name": "Just Chatting",
         "viewer_count": 42,
-        "started_at": datetime.now(timezone.utc).isoformat()
+        "started_at": __import__("datetime").datetime.utcnow().isoformat()+"Z"
     }
-    # fetch twitch user data
-    u = await bot.twitch.get_user(info["login"])
     await post_go_live(target, stream, u)
     await inter.response.send_message(f"Preview sent to {target.mention}.", ephemeral=True)
 
@@ -222,11 +282,8 @@ async def post_go_live(channel: discord.TextChannel, stream: dict, user: dict):
     )
     embed.add_field(name="Category", value=game, inline=True)
     embed.add_field(name="Viewers",  value=str(viewers), inline=True)
-    # Preview image (Twitch generates dynamic thumbs for live streams)
     embed.set_image(url=stream_preview_url(login))
     embed.set_footer(text="Twitch • Go-Live Alert")
-
-    # Optional: author line (swap the icon URL for your brand mark if you want)
     embed.set_author(name="Crewmate Set Sail", icon_url="https://static-00.iconduck.com/assets.00/anchor-emoji-1024x1024-4n8e4b1w.png")
 
     content = f"{role_ping} {MEGAPHONE} Ahoy, Nakama! {display} just set sail → {url}" if role_ping else None
@@ -235,74 +292,60 @@ async def post_go_live(channel: discord.TextChannel, stream: dict, user: dict):
 # ── Live checker (runs every 2 minutes) ────────────────────────────────────────
 @tasks.loop(minutes=2)
 async def check_live():
-    data    = load_data()
-    chan_id = data.get("notify_channel_id")
-    if not chan_id:
-        return
+    # find the configured channel (per guild)
+    for g in bot.guilds:
+        chan_id = db_get_notify_channel(g.id)
+        if not chan_id:
+            continue
+        channel = bot.get_channel(chan_id)
+        if not isinstance(channel, discord.TextChannel):
+            continue
 
-    channel = bot.get_channel(chan_id)
-    if not isinstance(channel, discord.TextChannel):
-        return
+        # all registered users
+        twitch_ids = db_all_twitch_ids()
+        if not twitch_ids:
+            continue
 
-    users = data.get("users", {})
-    if not users:
-        return
+        # fetch live streams
+        streams = await bot.twitch.get_streams(twitch_ids)
+        live_role = get_role(g, LIVE_ROLE_ID)
 
-    # Who should we check?
-    user_ids  = [info["twitch_id"] for info in users.values()]
-    streams   = await bot.twitch.get_streams(user_ids)
-    live_cache = data.get("live_cache", {})
+        for r in db_list_users():
+            tid = r["twitch_id"]
+            stream = streams.get(tid)
+            member = g.get_member(int(r["discord_user_id"]))
 
-    # Get guild + LIVE role
-    guild     = channel.guild
-    live_role = get_role(guild, LIVE_ROLE_ID)
-
-    # Loop through all registered users
-    for uid, info in list(users.items()):
-        tid    = info["twitch_id"]
-        stream = streams.get(tid)
-        member = guild.get_member(int(uid)) if guild else None
-
-        if stream:
-            # User is live → announce once per session
-            u = await bot.twitch.get_user(info["login"])
-            started_at = stream["started_at"]
-            if not already_announced(live_cache, tid, started_at):
-                try:
-                    await post_go_live(channel, stream, u)
-                    live_cache[tid] = started_at
-                except Exception as e:
-                    print("Post error:", e)
-
-            # Give LIVE role while streaming
-            if live_role and member and live_role not in member.roles:
-                try:
-                    await member.add_roles(live_role, reason="Now live")
-                except Exception as e:
-                    print("Add role error:", e)
-
-        else:
-            # Not live → clear cache so next stream can be announced again
-            live_cache.pop(tid, None)
-
-            # Remove LIVE role after stream ends
-            if live_role and member and live_role in member.roles:
-                try:
-                    await member.remove_roles(live_role, reason="Stream ended")
-                except Exception as e:
-                    print("Remove role error:", e)
-
-    data["live_cache"] = live_cache
-    save_data(data)
+            if stream:
+                # announce once per session
+                started_at = stream["started_at"]
+                if not already_announced(tid, started_at):
+                    u = await bot.twitch.get_user(r["twitch_login"])
+                    try:
+                        await post_go_live(channel, stream, u)
+                        db_set_live(tid, started_at)
+                    except Exception as e:
+                        print("Post error:", e)
+                # give LIVE role
+                if live_role and member and live_role not in member.roles:
+                    try:
+                        await member.add_roles(live_role, reason="Now live")
+                    except Exception as e:
+                        print("Add role error:", e)
+            else:
+                # clear live flag & remove LIVE role
+                db_clear_live(tid)
+                if live_role and member and live_role in member.roles:
+                    try:
+                        await member.remove_roles(live_role, reason="Stream ended")
+                    except Exception as e:
+                        print("Remove role error:", e)
 
 @check_live.before_loop
 async def before_check_live():
     await bot.wait_until_ready()
 
-
 # ── Run it ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not (DISCORD_TOKEN and TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET):
-        raise SystemExit("Missing secrets. Check your .env file.")
+        raise SystemExit("Missing secrets. Check your env vars.")
     bot.run(DISCORD_TOKEN)
-
