@@ -17,8 +17,12 @@ def db_connect():
     url = os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError("Missing DATABASE_URL environment variable.")
-    # psycopg2 connects synchronously; we keep operations short & infrequent
+    # Ensure SSL on Railway if not already present
+    if "sslmode=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}sslmode=require"
     return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
+
 
 def db_exec(sql: str, params: tuple = ()):
     with db_connect() as conn:
@@ -203,6 +207,19 @@ class Bot(discord.Client):
 bot = Bot()
 
 # ── Slash Commands ─────────────────────────────────────────────────────────────
+@bot.tree.error
+async def on_app_command_error(inter: discord.Interaction, error: Exception):
+    # Log to console
+    print("Slash command error:", repr(error))
+    # Try to tell the user instead of silently failing
+    try:
+        if inter.response.is_done():
+            await inter.followup.send("Oops! I hit an error running that command. The crew is on it. 🛠️", ephemeral=True)
+        else:
+            await inter.response.send_message("Oops! I hit an error running that command. The crew is on it. 🛠️", ephemeral=True)
+    except Exception as e:
+        print("Failed to send error message:", e)
+
 @bot.tree.command(name="twitch_set", description="Link your Twitch username")
 @app_commands.describe(username="Your Twitch @ (login name, not display name)")
 async def twitch_set(inter: discord.Interaction, username: str):
@@ -263,6 +280,9 @@ async def twitch_preview(inter: discord.Interaction, channel: discord.TextChanne
     }
     await post_go_live(target, stream, u)
     await inter.response.send_message(f"Preview sent to {target.mention}.", ephemeral=True)
+@bot.tree.command(name="ping", description="Quick health check")
+async def ping(inter: discord.Interaction):
+    await inter.response.send_message("Pong! 🏴‍☠️", ephemeral=True)
 
 # ── Posting the go-live embed ──────────────────────────────────────────────────
 async def post_go_live(channel: discord.TextChannel, stream: dict, user: dict):
