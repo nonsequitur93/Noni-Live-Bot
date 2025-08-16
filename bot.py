@@ -112,6 +112,11 @@ TWITCH_CLIENT_SECRET  = os.getenv("TWITCH_CLIENT_SECRET")
 GUILD_ID              = int(os.getenv("GUILD_ID", "0"))
 MENTION_ROLE_ID       = os.getenv("MENTION_ROLE_ID")   # optional
 LIVE_ROLE_ID          = os.getenv("LIVE_ROLE_ID")      # optional LIVE role while streaming
+# Marvel Rivals forwarding config
+TEST_CHANNEL_ID = int(os.getenv("TEST_CHANNEL_ID", "0"))
+MR_THREAD_ID    = int(os.getenv("MR_THREAD_ID", "0"))
+MR_ROLE_ID      = int(os.getenv("MR_ROLE_ID", "0"))
+DELETE_SOURCE   = os.getenv("DELETE_SOURCE", "true").lower() in ("1","true","yes","y")
 
 # ── Twitch API helper ──────────────────────────────────────────────────────────
 class TwitchAPI:
@@ -181,6 +186,7 @@ def get_role(guild: discord.Guild, role_id: str | None):
 class Bot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
+        intents.message_content = True  # needed to read & forward messages from #test
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.session: Optional[aiohttp.ClientSession] = None
@@ -205,6 +211,58 @@ class Bot(discord.Client):
             await self.session.close()
 
 bot = Bot()
+async def _forward_to_thread(src: discord.Message, thread: discord.Thread):
+    # Unarchive if needed
+    if isinstance(thread, discord.Thread) and thread.archived:
+        try:
+            await thread.edit(archived=False, locked=False)
+        except Exception as e:
+            print("Thread unarchive error:", e)
+
+    # Re-upload attachments
+    files = []
+    for a in src.attachments:
+        try:
+            files.append(await a.to_file())
+        except Exception as e:
+            print("Attachment fetch error:", e)
+
+    # Build content with role ping (no header)
+    role_ping = f"<@&{MR_ROLE_ID}>" if MR_ROLE_ID else ""
+    original   = src.content or ""
+    content    = (role_ping + ("\n" if role_ping and original else "")) + original
+    if not content and role_ping:
+        content = role_ping  # if source was embeds-only
+
+    embeds = src.embeds if src.embeds else None
+    allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
+
+    await thread.send(content=content, embeds=embeds, files=files, allowed_mentions=allowed)
+
+@bot.event
+async def on_message(message: discord.Message):
+    # ignore DMs & ourselves
+    if not message.guild or message.author == bot.user:
+        return
+
+    # only watch the #test channel
+    if not TEST_CHANNEL_ID or message.channel.id != TEST_CHANNEL_ID:
+        return
+
+    # get destination thread
+    dest = message.guild.get_thread(MR_THREAD_ID)
+    if not isinstance(dest, discord.Thread):
+        print("Marvel relay: destination thread not found (check MR_THREAD_ID).")
+        return
+
+    try:
+        await _forward_to_thread(message, dest)
+        if DELETE_SOURCE:
+            await message.delete()
+    except discord.Forbidden:
+        print("Marvel relay: missing perms (Manage Messages in #test; Send/Embed/Attach in thread).")
+    except Exception as e:
+        print("Marvel relay error:", repr(e))
 
 # ── Slash Commands ─────────────────────────────────────────────────────────────
 @bot.tree.error
