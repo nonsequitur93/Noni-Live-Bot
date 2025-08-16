@@ -385,10 +385,11 @@ async def post_go_live(channel: discord.TextChannel, stream: dict, user: dict):
     await channel.send(content=content, embed=embed)
 
 # ── Live checker (runs every 2 minutes) ────────────────────────────────────────
+from discord.ext import tasks
+
 @tasks.loop(minutes=2)
 async def check_live():
     print("[live] tick")
-    # find the configured channel (per guild)
     for g in bot.guilds:
         chan_id = db_get_notify_channel(g.id)
         if not chan_id:
@@ -397,12 +398,10 @@ async def check_live():
         if not isinstance(channel, discord.TextChannel):
             continue
 
-        # all registered users
         twitch_ids = db_all_twitch_ids()
         if not twitch_ids:
             continue
 
-        # fetch live streams
         streams = await bot.twitch.get_streams(twitch_ids)
         live_role = get_role(g, LIVE_ROLE_ID)
 
@@ -411,7 +410,7 @@ async def check_live():
             stream = streams.get(tid)
             member = g.get_member(int(r["discord_user_id"]))
 
-                       if stream:
+            if stream:
                 # announce once per stream session (use stable stream.id)
                 stream_id = stream.get("id")
                 if stream_id and not already_announced(tid, stream_id):
@@ -430,7 +429,6 @@ async def check_live():
                         await member.add_roles(live_role, reason="Now live")
                     except Exception as e:
                         print("Add role error:", e)
-
             else:
                 # clear live flag & remove LIVE role
                 db_clear_live(tid)
@@ -441,10 +439,10 @@ async def check_live():
                     except Exception as e:
                         print("Remove role error:", e)
 
-
 @check_live.before_loop
 async def before_check_live():
     await bot.wait_until_ready()
+
 
 # ── Run it ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
