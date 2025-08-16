@@ -42,6 +42,7 @@ def init_db():
         notify_channel_id BIGINT
     );
     """)
+
     db_exec("""
     CREATE TABLE IF NOT EXISTS users (
         discord_user_id BIGINT PRIMARY KEY,
@@ -50,12 +51,17 @@ def init_db():
         display_name TEXT
     );
     """)
+
     db_exec("""
     CREATE TABLE IF NOT EXISTS live_state (
         twitch_id TEXT PRIMARY KEY,
         started_at TIMESTAMPTZ
     );
     """)
+
+    # must come AFTER the table exists
+    db_exec("ALTER TABLE live_state ADD COLUMN IF NOT EXISTS stream_id TEXT;")
+
 
 def db_set_notify_channel(guild_id: int, channel_id: int):
     db_exec("""
@@ -103,6 +109,17 @@ def db_set_live(twitch_id: str, started_at_iso: str):
 
 def db_clear_live(twitch_id: str):
     db_exec("DELETE FROM live_state WHERE twitch_id=%s;", (twitch_id,))
+    
+def db_get_stream_id(twitch_id: str) -> Optional[str]:
+    rows = db_exec("SELECT stream_id FROM live_state WHERE twitch_id=%s;", (twitch_id,))
+    return rows[0]["stream_id"] if rows and rows[0]["stream_id"] else None
+
+def db_set_stream_id(twitch_id: str, stream_id: str):
+    db_exec("""
+    INSERT INTO live_state (twitch_id, stream_id)
+    VALUES (%s, %s)
+    ON CONFLICT (twitch_id) DO UPDATE SET stream_id=EXCLUDED.stream_id;
+    """, (twitch_id, stream_id))
 
 # ── Load secrets ───────────────────────────────────────────────────────────────
 load_dotenv()
@@ -172,9 +189,8 @@ def is_mod(inter: discord.Interaction) -> bool:
     perms = inter.user.guild_permissions
     return perms.administrator or perms.manage_guild
 
-def already_announced(twitch_user_id: str, started_at: str) -> bool:
-    prev = db_live_started(twitch_user_id)
-    return prev == started_at
+def already_announced(twitch_user_id: str, stream_id: str) -> bool:
+    return db_get_stream_id(twitch_user_id) == stream_id
 
 def stream_preview_url(login: str, w=1280, h=720):
     return f"https://static-cdn.jtvnw.net/previews-ttv/live_user_{login}-{w}x{h}.jpg"
@@ -187,6 +203,7 @@ class Bot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True  # needed to read & forward messages from #test
+        intents.members = True 
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.session: Optional[aiohttp.ClientSession] = None
@@ -370,6 +387,7 @@ async def post_go_live(channel: discord.TextChannel, stream: dict, user: dict):
 # ── Live checker (runs every 2 minutes) ────────────────────────────────────────
 @tasks.loop(minutes=2)
 async def check_live():
+    print("[live] tick")
     # find the configured channel (per guild)
     for g in bot.guilds:
         chan_id = db_get_notify_channel(g.id)
@@ -393,30 +411,36 @@ async def check_live():
             stream = streams.get(tid)
             member = g.get_member(int(r["discord_user_id"]))
 
-            if stream:
-                # announce once per session
-                started_at = stream["started_at"]
-                if not already_announced(tid, started_at):
+                       if stream:
+                # announce once per stream session (use stable stream.id)
+                stream_id = stream.get("id")
+                if stream_id and not already_announced(tid, stream_id):
                     u = await bot.twitch.get_user(r["twitch_login"])
                     try:
                         await post_go_live(channel, stream, u)
-                        db_set_live(tid, started_at)
+                        db_set_stream_id(tid, stream_id)
+                        print(f"[live] announced once for {r['twitch_login']} (stream_id={stream_id})")
                     except Exception as e:
                         print("Post error:", e)
+
                 # give LIVE role
                 if live_role and member and live_role not in member.roles:
                     try:
+                        print(f"[live] add LIVE role → {member} ({member.id})")
                         await member.add_roles(live_role, reason="Now live")
                     except Exception as e:
                         print("Add role error:", e)
+
             else:
                 # clear live flag & remove LIVE role
                 db_clear_live(tid)
                 if live_role and member and live_role in member.roles:
                     try:
+                        print(f"[live] remove LIVE role → {member} ({member.id})")
                         await member.remove_roles(live_role, reason="Stream ended")
                     except Exception as e:
                         print("Remove role error:", e)
+
 
 @check_live.before_loop
 async def before_check_live():
