@@ -492,6 +492,31 @@ async def apply_live_roles(inter: discord.Interaction):
 @bot.tree.command(name="ping", description="Quick health check")
 async def ping(inter: discord.Interaction):
     await inter.response.send_message("Pong! 🏴‍☠️", ephemeral=True)
+@bot.tree.command(name="twitch_list", description="Mods only: Show all users who have registered with the bot")
+async def twitch_list(inter: discord.Interaction):
+    if not is_mod(inter):
+        return await inter.response.send_message("Only Fleet Commanders can use this.", ephemeral=True)
+
+    rows = db_list_users()
+    if not rows:
+        return await inter.response.send_message("No Twitch users have registered yet.", ephemeral=True)
+
+    lines = []
+    for row in rows:
+        discord_id = row['discord_user_id']
+        display = row.get('display_name') or row['twitch_login']
+        login = row['twitch_login']
+        lines.append(f"<@{discord_id}> → **{display}** (`{login}`)")
+
+    message = "\n".join(lines)
+    if len(message) > 2000:
+        # Break into chunks if too long
+        chunks = [message[i:i+1900] for i in range(0, len(message), 1900)]
+        await inter.response.send_message("📜 Registered Twitch Users:", ephemeral=True)
+        for chunk in chunks:
+            await inter.followup.send(chunk, ephemeral=True)
+    else:
+        await inter.response.send_message("📜 Registered Twitch Users:\n" + message, ephemeral=True)
 
 # ── Posting the go-live embed ──────────────────────────────────────────────────
 async def post_go_live(channel: discord.TextChannel, stream: dict, user: dict):
