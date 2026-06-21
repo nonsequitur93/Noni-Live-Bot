@@ -281,6 +281,13 @@ async def on_message(message: discord.Message):
     # only watch the #test channel
     if TEST_CHANNEL_ID and message.channel.id == TEST_CHANNEL_ID:
         dest = message.guild.get_thread(MR_THREAD_ID)
+        if dest is None:
+            # Not in cache (e.g. thread went idle/archived) — fetch it directly via the API
+            try:
+                dest = await message.guild.fetch_channel(MR_THREAD_ID)
+            except (discord.NotFound, discord.Forbidden) as e:
+                print(f"Marvel relay: could not fetch thread {MR_THREAD_ID}: {e}")
+                dest = None
         if isinstance(dest, discord.Thread):
             try:
                 await _forward_to_thread(message, dest)
