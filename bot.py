@@ -256,23 +256,40 @@ async def _forward_to_thread(src: discord.Message, thread: discord.Thread):
             print("Thread unarchive error:", e)
 
     files = []
+    attachment_links = []
     for a in src.attachments:
         try:
             files.append(await a.to_file())
         except Exception as e:
-            print("Attachment fetch error:", e)
+            print(f"Attachment fetch error (will send as link): {e}")
+            attachment_links.append(a.url)
 
     role_ping = f"<@&{MR_ROLE_ID}>" if MR_ROLE_ID else ""
-    original   = src.content or ""
-    content    = (role_ping + ("\n" if role_ping and original else "")) + original
+    original  = src.content or ""
+    content   = (role_ping + ("\n" if role_ping and original else "")) + original
     if not content and role_ping:
         content = role_ping
 
+    if attachment_links:
+        link_text = "\n".join(attachment_links)
+        content = content + ("\n" if content else "") + link_text
+
     embeds = src.embeds if src.embeds else None
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
-    await thread.send(content=content, embeds=embeds, files=files, allowed_mentions=allowed)
-    print(f"Marvel relay: forwarded message {src.id} to thread {thread.id}")
 
+    try:
+        await thread.send(content=content, embeds=embeds, files=files, allowed_mentions=allowed)
+    except discord.HTTPException as e:
+        if e.status == 413:
+            # Files too large — strip files and send links instead
+            link_text2 = "\n".join(a.url for a in src.attachments)
+            fallback = (content + ("\n" if content else "") + link_text2).strip()
+            await thread.send(content=fallback, embeds=embeds, allowed_mentions=allowed)
+            print(f"Marvel relay: attachment too large, sent as link instead")
+        else:
+            raise
+
+    print(f"Marvel relay: forwarded message {src.id} to thread {thread.id}")
 @bot.event
 async def on_message(message: discord.Message):
     # ignore DMs & ourselves
